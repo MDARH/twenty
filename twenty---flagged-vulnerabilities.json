@@ -1,0 +1,134 @@
+{
+  "findings": [
+    {
+      "severity": "high",
+      "location": "packages/twenty-server/src/engine/core-modules/domain-manager/guards/cloudflare-secret.guard.ts",
+      "title": "Cloudflare custom-hostname webhook authentication bypass via inverted OR condition",
+      "description": "CloudflareSecretMatchGuard is intended to require the cf-webhook-auth header to match CLOUDFLARE_WEBHOOK_SECRET before custom-hostname webhooks can mutate workspace customDomain / isCustomDomainEnabled. The allow condition uses `typeof request.headers['cf-webhook-auth'] === 'string' || timingSafeEqual(...)`. Because HTTP header values are strings, any present cf-webhook-auth value short-circuits the OR and returns true without comparing to CLOUDFLARE_WEBHOOK_SECRET. The timingSafeEqual branch is effectively dead for normal requests. When the secret is unset the guard also allows all callers.",
+      "impact": "Unauthenticated callers who know or guess a workspace custom hostname can POST to cloudflare/custom-hostname-webhooks or webhooks/cloudflare and clear or flip custom-domain state for that workspace, causing domain takeover confusion, denial of custom-domain access, or enabling a hostname after attacker-controlled DNS if Cloudflare still has a matching custom hostname record.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-059f9631-8410-5935-b0d2-2e46b1760031",
+      "commit_hash": "bba1b296c1df7dcf0aff62f57cb83d00178c1307",
+      "detected_at_pst": "2026-11-16T19:10:27-08:00",
+      "reported_link": "",
+      "attack_path": "1. Identify a target workspace customDomain (or observe Cloudflare hostname events).\n2. POST to /cloudflare/custom-hostname-webhooks or /webhooks/cloudflare with body.data.data.hostname set to that hostname and any string in the cf-webhook-auth header.\n3. Guard returns true without verifying CLOUDFLARE_WEBHOOK_SECRET; controller loads the workspace by customDomain and may null the domain or toggle isCustomDomainEnabled based on CustomDomainService lookups.",
+      "evidence": [
+        "packages/twenty-server/src/engine/core-modules/domain-manager/guards/cloudflare-secret.guard.ts:21-32",
+        "packages/twenty-server/src/engine/core-modules/domain-manager/controllers/cloudflare.controller.ts:42-97"
+      ],
+      "remediation": "Require a configured CLOUDFLARE_WEBHOOK_SECRET in production. Compare only when the header is a string of equal length, using timingSafeEqual (or crypto.timingSafeEqual after hashing). Change the condition to AND (type check && equal), never OR. Reject when the secret is missing or the header is absent/mismatched.",
+      "poc_video_notes": "Logic verified with a Node reproduction of the guard condition: any string header bypasses when CLOUDFLARE_WEBHOOK_SECRET is set. No live Cloudflare webhook receiver was exercised in this environment."
+    },
+    {
+      "severity": "high",
+      "location": "packages/twenty-server/src/engine/core-modules/workspace/services/workspace.service.ts",
+      "title": "updateWorkspace allows privilege-sensitive fields without SECURITY/ROLES permission checks",
+      "description": "updateWorkspace is guarded only by WorkspaceAuthGuard. validateSecurityPermissions only gates isGoogleAuthEnabled, isMicrosoftAuthEnabled, isPasswordAuthEnabled, and isPublicInviteLinkEnabled. validateWorkspacePermissions only gates displayName, subdomain, customDomain, and logo. UpdateWorkspaceInput also accepts defaultRoleId, inviteHash, and allowImpersonation, which are saved via workspaceRepository.save({...workspace, ...payload}) with no permission check. Any authenticated workspace member can learn Admin role IDs via currentUser.workspaceMembers.roles (RoleDTO is exposed) and set defaultRoleId to that Admin role.",
+      "impact": "A low-privilege workspace member can set defaultRoleId to Admin so subsequent public-invite or personal-invite joiners become admins; rotate inviteHash to a known value; and enable allowImpersonation. That is workspace privilege escalation and invite/impersonation policy bypass.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-059f9631-8410-5935-b0d2-2e46b1760031",
+      "commit_hash": "bba1b296c1df7dcf0aff62f57cb83d00178c1307",
+      "detected_at_pst": "2026-11-16T19:10:27-08:00",
+      "reported_link": "",
+      "attack_path": "1. Authenticate as a normal workspace member.\n2. Query currentUser { workspaceMembers { roles { id label } } } (and/or currentWorkspace { inviteHash defaultRole { id } }) to obtain the Admin role UUID.\n3. Call mutation updateWorkspace(data: { defaultRoleId: \"<admin-role-id>\" }) — no ROLES/SECURITY check runs.\n4. Optionally set inviteHash to an attacker-chosen value. Join with a second account via the public invite link (isPublicInviteLinkEnabled defaults true) and receive the Admin default role via addUserToWorkspaceIfUserNotInWorkspace.",
+      "evidence": [
+        "packages/twenty-server/src/engine/core-modules/workspace/workspace.resolver.ts:122-138",
+        "packages/twenty-server/src/engine/core-modules/workspace/dtos/update-workspace-input.ts:159-192",
+        "packages/twenty-server/src/engine/core-modules/workspace/services/workspace.service.ts:160-173",
+        "packages/twenty-server/src/engine/core-modules/workspace/services/workspace.service.ts:436-517",
+        "packages/twenty-server/src/engine/core-modules/workspace/services/workspace.service.ts:220-224",
+        "packages/twenty-server/src/engine/core-modules/user/user.resolver.ts:232-297",
+        "packages/twenty-server/src/engine/core-modules/user-workspace/user-workspace.service.ts:168-181"
+      ],
+      "remediation": "Require SettingPermissionType.SECURITY (or ROLES/WORKSPACE_MEMBERS as appropriate) before accepting defaultRoleId, inviteHash, or allowImpersonation. Prefer server-generated inviteHash rotation instead of client-supplied values. Validate that defaultRoleId belongs to the same workspace and is an allowed default (non-Admin unless caller is Admin).",
+      "poc_video_notes": "Validated from authorization control flow and GraphQL schema exposure; a live multi-user workspace was not available to execute the second-account join step in this environment."
+    },
+    {
+      "severity": "high",
+      "location": "packages/twenty-server/src/engine/core-modules/workflow/controllers/workflow-trigger.controller.ts",
+      "title": "Workflow webhook trigger ignores configured API_KEY authentication",
+      "description": "Webhook-triggered workflows expose unauthenticated GET/POST /webhooks/workflows/:workspaceId/:workflowId behind PublicEndpointGuard only. The trigger type allows settings.authentication = 'API_KEY' | null and the frontend offers an 'API key' option, but the controller never reads Authorization/api keys and never inspects workflowVersion.trigger.settings.authentication. It loads workflow data with shouldBypassPermissionChecks: true and runs the published version for any caller who knows the UUIDs.",
+      "impact": "Anyone who obtains workspaceId and workflowId (often present in UI URLs, logs, or shared webhook URLs) can invoke active webhook workflows, including side effects such as record writes, outbound HTTP, or email actions, and can abuse them for spam or data manipulation. Selecting 'API key' in the UI provides a false sense of security.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-059f9631-8410-5935-b0d2-2e46b1760031",
+      "commit_hash": "bba1b296c1df7dcf0aff62f57cb83d00178c1307",
+      "detected_at_pst": "2026-11-16T19:10:27-08:00",
+      "reported_link": "",
+      "attack_path": "1. Obtain workspaceId and a webhook-triggered workflowId (from a shared webhook URL, UI, or leak).\n2. GET or POST /webhooks/workflows/{workspaceId}/{workflowId} with an arbitrary JSON body and no Authorization header.\n3. Controller confirms the workflow has an active WEBHOOK trigger and executes it, returning workflowRunId.",
+      "evidence": [
+        "packages/twenty-server/src/engine/core-modules/workflow/controllers/workflow-trigger.controller.ts:42-149",
+        "packages/twenty-server/src/modules/workflow/workflow-trigger/types/workflow-trigger.type.ts:64-77",
+        "packages/twenty-front/src/modules/workflow/workflow-trigger/constants/WebhookTriggerAuthenticationOptions.ts:1-19"
+      ],
+      "remediation": "When settings.authentication === 'API_KEY', require a valid workspace API key (or a dedicated webhook secret) before runWorkflowVersion. Prefer unguessable webhook secrets in the path or HMAC signatures. Rate-limit these public endpoints.",
+      "poc_video_notes": "Controller path contains no authentication branch for API_KEY; confirmed by full-file review of workflow-trigger.controller.ts and absence of auth checks under engine/core-modules/workflow."
+    },
+    {
+      "severity": "medium",
+      "location": "packages/twenty-server/src/engine/core-modules/health/controllers/health.controller.ts",
+      "title": "Unauthenticated /healthz/:indicatorId exposes database, Redis, worker, and workspace internals",
+      "description": "GET /healthz is a shallow liveness check, but GET /healthz/:indicatorId is also PublicEndpointGuard-protected and returns rich diagnostics. database returns Postgres version, connection counts, database size, top tables (schemaname/relname), cache hit ratio, deadlocks, and slow query counts. redis returns INFO-derived memory/clients/stats/replication. app returns total workspace counts and up to 500 workspaceIds with pending migrations.",
+      "impact": "Unauthenticated internet clients can fingerprint the stack, observe capacity and failure modes, and enumerate workspace IDs tied to migration problems—useful reconnaissance for further attacks and operational intelligence leakage.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-059f9631-8410-5935-b0d2-2e46b1760031",
+      "commit_hash": "bba1b296c1df7dcf0aff62f57cb83d00178c1307",
+      "detected_at_pst": "2026-11-16T19:10:27-08:00",
+      "reported_link": "",
+      "attack_path": "1. GET /healthz/database, /healthz/redis, /healthz/worker, /healthz/app, and /healthz/connectedAccount without credentials.\n2. Parse JSON details for versions, table names, and workspaceIds.",
+      "evidence": [
+        "packages/twenty-server/src/engine/core-modules/health/controllers/health.controller.ts:36-54",
+        "packages/twenty-server/src/engine/core-modules/health/indicators/database.health.ts:28-101",
+        "packages/twenty-server/src/engine/core-modules/health/indicators/redis.health.ts:24-92",
+        "packages/twenty-server/src/engine/core-modules/health/indicators/app.health.ts:29-68"
+      ],
+      "remediation": "Keep unauthenticated /healthz as a boolean/liveness probe only. Move detailed indicators behind admin auth, network policy, or a separate internal port. Strip workspaceIds and table inventories from public responses.",
+      "poc_video_notes": "Source-confirmed public routing and detail payloads; server not running in this scan environment for a live HTTP capture."
+    },
+    {
+      "severity": "medium",
+      "location": "packages/twenty-server/src/main.ts",
+      "title": "Nest application enables CORS for all origins",
+      "description": "NestFactory.create is configured with cors: true, which reflects arbitrary Origin values. Combined with cookie-based express-session (proxy trust enabled; SameSite not explicitly set to Strict), browser clients from attacker origins can make credentialed cross-origin requests to the API host for session-backed flows.",
+      "impact": "Increases CSRF and cross-origin abuse risk for session-oriented endpoints (notably OAuth/SSO browser redirects and any cookie-authenticated routes). Bearer-token GraphQL is less affected, but the global policy is overly permissive for production multi-tenant CRM data.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-059f9631-8410-5935-b0d2-2e46b1760031",
+      "commit_hash": "bba1b296c1df7dcf0aff62f57cb83d00178c1307",
+      "detected_at_pst": "2026-11-16T19:10:27-08:00",
+      "reported_link": "",
+      "attack_path": "1. Host a malicious page that issues fetch/XHR to the Twenty API origin with credentials: 'include'.\n2. Because CORS mirrors the attacker Origin, the browser permits the cross-origin call for cookie/session contexts where SameSite allows it.",
+      "evidence": [
+        "packages/twenty-server/src/main.ts:25-26",
+        "packages/twenty-server/src/engine/core-modules/session-storage/session-storage.module-factory.ts:27-35"
+      ],
+      "remediation": "Replace cors: true with an explicit origin allowlist (workspace front domains). Set cookie SameSite=Lax or Strict intentionally, and avoid credentialed CORS for APIs that only need Authorization headers.",
+      "poc_video_notes": "Configuration confirmed in main.ts and session factory; no browser PoC recorded in this environment."
+    },
+    {
+      "severity": "medium",
+      "location": "packages/twenty-docker/docker-compose.yml",
+      "title": "Docker/K8s defaults ship weak APP_SECRET and postgres credentials",
+      "description": "docker-compose.yml defaults APP_SECRET to replace_me_with_a_random_string and Postgres user/password to postgres/postgres when env overrides are omitted. The k8s server deployment hardcodes PG_DATABASE_URL with username postgres and password postgres in the manifest example. APP_SECRET derives JWT HMAC keys via JwtWrapperService.generateAppSecret.",
+      "impact": "Operators who deploy the sample compose/k8s manifests without rotating secrets get forgeable JWTs (access/file/transient tokens) and a trivial database password. That is full application takeover on internet-exposed self-hosted instances.",
+      "verified": true,
+      "status": "active",
+      "background_composer_id": "bc-059f9631-8410-5935-b0d2-2e46b1760031",
+      "commit_hash": "bba1b296c1df7dcf0aff62f57cb83d00178c1307",
+      "detected_at_pst": "2026-11-16T19:10:27-08:00",
+      "reported_link": "",
+      "attack_path": "1. Deploy using unmodified docker-compose or the sample k8s manifests.\n2. Use the default APP_SECRET placeholder to forge tokens, or authenticate to Postgres with the default postgres credentials from PG_DATABASE_URL / POSTGRES_PASSWORD.",
+      "evidence": [
+        "packages/twenty-docker/docker-compose.yml:12-23",
+        "packages/twenty-docker/docker-compose.yml:112-113",
+        "packages/twenty-docker/k8s/manifests/deployment-server.yaml:40-41",
+        "packages/twenty-server/src/engine/core-modules/jwt/services/jwt-wrapper.service.ts:127-136"
+      ],
+      "remediation": "Fail startup when APP_SECRET is missing or equals the placeholder. Remove plaintext default DB passwords from committed manifests; require secrets via env/Secret objects. Document mandatory rotation in deploy docs (already partially present) and enforce it in entrypoint checks.",
+      "poc_video_notes": "Defaults confirmed in compose and k8s manifests; no production cluster was targeted."
+    }
+  ]
+}
